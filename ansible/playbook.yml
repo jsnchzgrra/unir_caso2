@@ -1,0 +1,163 @@
+---
+- name: Despliegue Automatizado - Caso Práctico 2 UNIR
+  hosts: nodes
+  become: yes
+  vars:
+    acr_name: "acruniread2cp2"
+    acr_user: "acruniread2cp2" 
+    acr_password: "4jipemEesyvzipYEcoCWp1tc13fBY3baXpu4fZKRzYoLGaLEAQEqJQQJ99CCAChHRaEEqg7NAAACAZCRFVG6"
+    app_namespace: "unir"
+
+  tasks:
+    # --- FASE 1: PREPARACIÓN VM (Confirmado que funciona) ---
+    - name: 1. Instalar Podman y dependencias
+      apt:
+        name: [podman, python3-pip]
+        update_cache: yes
+        state: present
+
+    - name: 2. Login en el ACR de Azure
+      containers.podman.podman_login:
+        username: "{{ acr_user }}"
+        password: "{{ acr_password }}"
+        registry: "{{ acr_name }}.azurecr.io"
+
+    # --- FASE 2: GESTIÓN DE IMÁGENES (Copiado de lo que te dio 'OK') ---
+    
+    # VOTING
+    - name: 3.1. Pull Voting
+      containers.podman.podman_image:
+        name: docker.io/dockersamples/examplevotingapp_vote:latest
+    - name: 3.2. Tag Voting
+      containers.podman.podman_tag:
+        image: docker.io/dockersamples/examplevotingapp_vote:latest
+        target_names: ["{{ acr_name }}.azurecr.io/unir/vote:latest"]
+    - name: 3.3. Push Voting
+      containers.podman.podman_image:
+        name: "{{ acr_name }}.azurecr.io/unir/vote:latest"
+        push: true
+
+    # RESULT
+    - name: 4.1. Pull Result
+      containers.podman.podman_image:
+        name: docker.io/dockersamples/examplevotingapp_result:latest
+    - name: 4.2. Tag Result
+      containers.podman.podman_tag:
+        image: docker.io/dockersamples/examplevotingapp_result:latest
+        target_names: ["{{ acr_name }}.azurecr.io/unir/result:latest"]
+    - name: 4.3. Push Result
+      containers.podman.podman_image:
+        name: "{{ acr_name }}.azurecr.io/unir/result:latest"
+        push: true
+
+    # REDIS
+    - name: 5.1. Pull Redis
+      containers.podman.podman_image:
+        name: docker.io/library/redis:alpine
+    - name: 5.2. Tag Redis
+      containers.podman.podman_tag:
+        image: docker.io/library/redis:alpine
+        target_names: ["{{ acr_name }}.azurecr.io/unir/redis:latest"]
+    - name: 5.3. Push Redis
+      containers.podman.podman_image:
+        name: "{{ acr_name }}.azurecr.io/unir/redis:latest"
+        push: true
+
+    # --- FASE 3: DESPLIEGUE EN AKS (Corregido el error de Namespace) ---
+
+    - name: 6. Crear Namespace 'unir'
+      delegate_to: localhost
+      become: no
+      kubernetes.core.k8s:
+        name: "{{ app_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    - name: 7. Desplegar Recursos en AKS
+      delegate_to: localhost
+      become: no
+      kubernetes.core.k8s:
+        state: present
+        # IMPORTANTE: Definimos el namespace aquí para que se aplique a todo lo de abajo
+        namespace: "{{ app_namespace }}"
+        definition:
+          # A. PVC para Redis (Persistencia)
+          - apiVersion: v1
+            kind: PersistentVolumeClaim
+            metadata:
+              name: redis-pvc
+            spec:
+              accessModes: [ReadWriteOnce]
+              resources:
+                requests:
+                  storage: 1Gi
+
+          # B. REDIS
+          - apiVersion: apps/v1
+            kind: Deployment
+            metadata:
+              name: redis
+            spec:
+              selector: { matchLabels: { app: redis } }
+              template:
+                metadata: { labels: { app: redis } }
+                spec:
+                  containers:
+                  - name: redis
+                    image: "{{ acr_name }}.azurecr.io/unir/redis:latest"
+                    volumeMounts:
+                    - name: redis-data
+                      mountPath: /data
+                  volumes:
+                  - name: redis-data
+                    persistentVolumeClaim:
+                      claimName: redis-pvc
+          - apiVersion: v1
+            kind: Service
+            metadata: { name: redis }
+            spec:
+              ports: [{ port: 6379, targetPort: 6379 }]
+              selector: { app: redis }
+
+          # C. VOTE APP
+          - apiVersion: apps/v1
+            kind: Deployment
+            metadata:
+              name: vote
+            spec:
+              selector: { matchLabels: { app: vote } }
+              template:
+                metadata: { labels: { app: vote } }
+                spec:
+                  containers:
+                  - name: vote
+                    image: "{{ acr_name }}.azurecr.io/unir/vote:latest"
+          - apiVersion: v1
+            kind: Service
+            metadata: { name: vote-service }
+            spec:
+              type: LoadBalancer
+              ports: [{ port: 80, targetPort: 80 }]
+              selector: { app: vote }
+
+          # D. RESULT APP
+          - apiVersion: apps/v1
+            kind: Deployment
+            metadata:
+              name: result
+            spec:
+              selector: { matchLabels: { app: result } }
+              template:
+                metadata: { labels: { app: result } }
+                spec:
+                  containers:
+                  - name: result
+                    image: "{{ acr_name }}.azurecr.io/unir/result:latest"
+          - apiVersion: v1
+            kind: Service
+            metadata: { name: result-service }
+            spec:
+              type: LoadBalancer
+              ports: [{ port: 80, targetPort: 80 }]
+              selector: { app: result }
